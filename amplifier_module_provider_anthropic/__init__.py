@@ -105,7 +105,14 @@ class AnthropicProvider:
         self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
 
         # Beta headers support for enabling experimental features
-        beta_headers_config = self.config.get("beta_headers")
+        # Check if enable_1m_context is configured (from init command)
+        # and translate it to the beta_headers format
+        if self.config.get("enable_1m_context", "").lower() == "true":
+            beta_headers_config = ["context-1m-2025-08-07"]
+            logger.info("[PROVIDER] 1M context enabled via enable_1m_context config")
+        else:
+            beta_headers_config = self.config.get("beta_headers")
+        
         default_headers = None
         if beta_headers_config:
             # Normalize to list (supports string or list of strings)
