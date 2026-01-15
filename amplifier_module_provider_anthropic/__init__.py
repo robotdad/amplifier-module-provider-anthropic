@@ -1548,7 +1548,7 @@ class AnthropicProvider:
         """
         tool: dict[str, Any] = {
             "type": "web_search_20250305",
-            "name": "web_search",
+            "name": "native_web_search",  # Distinct from foundation's web_search tool
         }
 
         # Optional: max_uses limits number of searches per request
