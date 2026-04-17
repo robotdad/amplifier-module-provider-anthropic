@@ -54,7 +54,7 @@ from anthropic import BadRequestError as AnthropicBadRequestError
 from anthropic import RateLimitError as AnthropicRateLimitError
 from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
-)  # Not exported in public API as of SDK v0.75.0
+)  # Not exported in public API as of SDK v0.96.0 (private import still works)
 
 
 @dataclass
@@ -216,6 +216,19 @@ class ModelCapabilities:
     supports_1m: bool = False
     supports_thinking: bool = False
     supports_adaptive_thinking: bool = False
+    supports_manual_thinking: bool = (
+        True  # P1: False on Opus 4.7+ (type="enabled" → 400)
+    )
+    supports_output_config: bool = False  # P2: output_config.effort GA
+    supports_sampling: bool = True  # P2: False = temperature silently ignored
+    thinking_display_required: bool = (
+        False  # P2: must send display:"summarized" to see thinking
+    )
+    supported_efforts: tuple[str, ...] = (
+        "low",
+        "medium",
+        "high",
+    )  # P2: valid effort levels
     default_thinking_budget: int = 0
     capability_tags: tuple[str, ...] = ("tools", "streaming", "json_mode")
 
@@ -537,7 +550,8 @@ class AnthropicProvider:
         )
         self._fallback_state_path: str = (
             str(configured_fallback_state_path)
-            if self._persist_fallback_state and configured_fallback_state_path is not None
+            if self._persist_fallback_state
+            and configured_fallback_state_path is not None
             else ""
         )
         self._last_fallback_state_read: float = 0.0
@@ -578,8 +592,7 @@ class AnthropicProvider:
                 "temperature": 0.7,
                 "timeout": 600.0,
                 "context_window": 1000000
-                if self._enable_1m_context
-                and self._default_caps.supports_1m
+                if self._enable_1m_context and self._default_caps.supports_1m
                 else self._default_caps.base_context_window,
                 "max_output_tokens": self._default_caps.max_output_tokens,
             },
@@ -824,12 +837,22 @@ class AnthropicProvider:
 
         if family == "opus":
             is_46_plus = not version_known or (major, minor) >= (4, 6)
+            is_47_plus = not version_known or (major, minor) >= (4, 7)
             return ModelCapabilities(
                 family="opus",
                 max_output_tokens=128000 if is_46_plus else 64000,
                 supports_1m=is_46_plus,
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,
+                supports_manual_thinking=not is_47_plus,
+                supports_output_config=is_47_plus,
+                supports_sampling=not is_47_plus,
+                thinking_display_required=is_47_plus,
+                supported_efforts=(
+                    ("low", "medium", "high", "xhigh")
+                    if is_47_plus
+                    else ("low", "medium", "high")
+                ),
                 default_thinking_budget=64000 if is_46_plus else 32000,
                 capability_tags=(
                     "tools",
@@ -947,7 +970,9 @@ class AnthropicProvider:
         if not supports_thinking and "thinking" in capability_tags:
             capability_tags = [tag for tag in capability_tags if tag != "thinking"]
 
-        base_context_window = runtime_info.max_input_tokens or base_caps.base_context_window
+        base_context_window = (
+            runtime_info.max_input_tokens or base_caps.base_context_window
+        )
         supports_1m = (
             runtime_info.max_input_tokens >= 1_000_000
             if runtime_info.max_input_tokens is not None
@@ -964,6 +989,11 @@ class AnthropicProvider:
             supports_1m=supports_1m,
             supports_thinking=supports_thinking,
             supports_adaptive_thinking=supports_adaptive_thinking,
+            supports_manual_thinking=base_caps.supports_manual_thinking,
+            supports_output_config=base_caps.supports_output_config,
+            supports_sampling=base_caps.supports_sampling,
+            thinking_display_required=base_caps.thinking_display_required,
+            supported_efforts=base_caps.supported_efforts,
             default_thinking_budget=default_thinking_budget,
             capability_tags=tuple(capability_tags),
         )
@@ -1013,12 +1043,13 @@ class AnthropicProvider:
         major, minor = self._detect_version(model_id, family)
         version = (major, minor)
 
-        # Anthropic's current context-window docs list 1M as a beta-header feature
-        # for Opus 4.6 and Sonnet 4.x. Keep the header scoped to those families so
-        # lower-tier fallbacks like Haiku don't inherit it.
+        # Send the 1M beta header for known 1M-capable versions and unknown
+        # versions (forward-compat).  The header is harmless on models where
+        # 1M context is already GA (e.g. Opus 4.7+), but omitting it breaks
+        # models that still need it.
         if family == "opus":
-            return version == (4, 6)
-        return family == "sonnet" and version in {(4, 0), (4, 5), (4, 6)}
+            return version == (0, 0) or version >= (4, 6)
+        return family == "sonnet" and (version == (0, 0) or version >= (4, 0))
 
     def _should_add_interleaved_beta(
         self,
@@ -1311,7 +1342,9 @@ class AnthropicProvider:
         except Exception:
             return {}
 
-    def _write_shared_fallback_state(self, family: str, window: _FallbackWindow) -> None:
+    def _write_shared_fallback_state(
+        self, family: str, window: _FallbackWindow
+    ) -> None:
         """Atomically persist fallback windows when cross-process sharing is enabled."""
         if not self._fallback_state_path:
             return
@@ -1609,7 +1642,10 @@ class AnthropicProvider:
             )
 
             # Guard against misconfigured fallback cycles.
-            if effective_model in attempted_models and effective_model not in full_retry_budget_used:
+            if (
+                effective_model in attempted_models
+                and effective_model not in full_retry_budget_used
+            ):
                 raise RuntimeError(
                     f"Overload fallback loop detected while resolving {requested_model}"
                 )
@@ -1654,8 +1690,9 @@ class AnthropicProvider:
                     attempted_models.discard(effective_model)
                     continue
 
-                if not self._fallback_on_overload or not self._is_overload_fallback_error(
-                    e
+                if (
+                    not self._fallback_on_overload
+                    or not self._is_overload_fallback_error(e)
                 ):
                     raise
 
@@ -1890,15 +1927,34 @@ class AnthropicProvider:
         all_messages = self._apply_message_cache_control(all_messages)
         logger.info(f"[PROVIDER] Final message count for API: {len(all_messages)}")
 
+        # Resolve model and capabilities BEFORE building params dict,
+        # so per-model param gating (temperature, output_config) can apply.
+        effective_model = kwargs.get("model", self.default_model)
+        request_caps = await self._get_request_capabilities(effective_model)
+        model_ceiling = request_caps.max_output_tokens
+
         # Prepare request parameters
-        params = {
-            "model": kwargs.get("model", self.default_model),
+        params: dict[str, Any] = {
+            "model": effective_model,
             "messages": all_messages,
             "max_tokens": request.max_output_tokens
             or kwargs.get("max_tokens", self.max_tokens),
-            "temperature": request.temperature
-            or kwargs.get("temperature", self.temperature),
         }
+
+        # Only include temperature for models that support sampling.
+        # Opus 4.7+ silently ignores temperature — omitting it avoids user confusion
+        # and keeps request payloads clean.
+        if request_caps.supports_sampling:
+            params["temperature"] = request.temperature or kwargs.get(
+                "temperature", self.temperature
+            )
+        else:
+            if request.temperature is not None or kwargs.get("temperature") is not None:
+                logger.info(
+                    "[PROVIDER] Model %s does not support sampling parameters"
+                    " — ignoring temperature setting",
+                    params["model"],
+                )
 
         if system_blocks:
             params["system"] = system_blocks
@@ -1921,9 +1977,6 @@ class AnthropicProvider:
             # Add web search tool at the beginning (native tools typically come first)
             params["tools"].insert(0, web_search_tool)
             logger.info("[PROVIDER] Native web search tool enabled")
-
-        request_caps = await self._get_request_capabilities(params["model"])
-        model_ceiling = request_caps.max_output_tokens
         resolved_thinking_type: str | None = None
 
         # Enable extended thinking if requested (equivalent to OpenAI's reasoning)
@@ -1968,6 +2021,8 @@ class AnthropicProvider:
             # | "high"          | "adaptive"*   | generous (model default)  |
             # | None            | (existing)    | (existing)                |
             # * falls back to "enabled" if model doesn't support adaptive
+            # * On Opus 4.7+ "enabled" is intercepted → forced to "adaptive"
+            #   (models without supports_manual_thinking reject type="enabled")
 
             effort_thinking_type: str | None = None
             effort_budget: int | None = None
@@ -1980,6 +2035,9 @@ class AnthropicProvider:
             elif reasoning_effort == "high":
                 effort_thinking_type = "adaptive"
                 effort_budget = request_caps.default_thinking_budget
+            elif reasoning_effort == "xhigh":
+                effort_thinking_type = "adaptive"
+                effort_budget = request_caps.default_thinking_budget
 
             # Resolve budget: kwargs > reasoning_effort > config > model default
             budget_tokens = (
@@ -1990,9 +2048,7 @@ class AnthropicProvider:
             )
             budget_tokens = max(1024, int(budget_tokens))
             max_budget_tokens = (
-                model_ceiling
-                if params.get("tools")
-                else max(1024, model_ceiling - 1)
+                model_ceiling if params.get("tools") else max(1024, model_ceiling - 1)
             )
             budget_tokens = min(budget_tokens, max_budget_tokens)
             buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
@@ -2015,6 +2071,19 @@ class AnthropicProvider:
             if thinking_type == "adaptive" and request_caps.supports_adaptive_thinking:
                 params["thinking"] = {"type": "adaptive"}
                 resolved_thinking_type = "adaptive"
+            elif not request_caps.supports_manual_thinking:
+                # Model rejects type="enabled" (e.g. Opus 4.7+) — force adaptive.
+                # This is safe because models that don't support manual thinking
+                # always support adaptive thinking.
+                if thinking_type != "adaptive":
+                    logger.info(
+                        "[PROVIDER] Model %s does not support manual thinking "
+                        "(type='enabled') — using adaptive instead of '%s'",
+                        params["model"],
+                        thinking_type,
+                    )
+                params["thinking"] = {"type": "adaptive"}
+                resolved_thinking_type = "adaptive"
             else:
                 # "enabled" mode (all thinking-capable models): explicit budget
                 if thinking_type == "adaptive":
@@ -2026,8 +2095,21 @@ class AnthropicProvider:
                     "budget_tokens": budget_tokens,
                 }
 
-            # CRITICAL: Anthropic requires temperature=1.0 when thinking is enabled
-            params["temperature"] = 1.0
+            # For models where thinking.display defaults to "omitted" (Opus 4.7+),
+            # request "summarized" so thinking content is visible to users.
+            # Users can override via config or kwargs to "omitted" if desired.
+            if request_caps.thinking_display_required:
+                display = kwargs.get(
+                    "thinking_display",
+                    self.config.get("thinking_display", "summarized"),
+                )
+                params["thinking"]["display"] = display
+
+            # Anthropic requires temperature=1.0 when thinking is enabled
+            # on models that support sampling. Non-sampling models (4.7+)
+            # ignore temperature entirely — don't inject it.
+            if request_caps.supports_sampling:
+                params["temperature"] = 1.0
 
             # Ensure max_tokens accommodates thinking budget + response.
             # For adaptive mode the model manages its own budget within
@@ -2045,9 +2127,10 @@ class AnthropicProvider:
             interleaved_thinking_enabled = bool(params.get("tools"))
 
             logger.info(
-                "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=1.0, max_tokens=%s, interleaved=%s)",
+                "[PROVIDER] Extended thinking enabled (budget=%s, buffer=%s, temperature=%s, max_tokens=%s, interleaved=%s)",
                 thinking_budget,
                 buffer_tokens,
+                params.get("temperature", "n/a"),
                 params["max_tokens"],
                 interleaved_thinking_enabled,
             )
@@ -2060,6 +2143,30 @@ class AnthropicProvider:
                 params["model"],
             )
             params["max_tokens"] = model_ceiling
+
+        # Build output_config for models that support it (Opus 4.7+).
+        # output_config.effort is the primary control surface for thinking
+        # intensity on these models, replacing the budget_tokens approach.
+        if request_caps.supports_output_config and reasoning_effort is not None:
+            # kwargs["effort"] allows overriding output_config.effort independently
+            # of reasoning_effort (e.g. reasoning_effort="high" for thinking type,
+            # but effort="xhigh" for output config intensity).
+            effort = kwargs.get("effort", reasoning_effort)
+            if effort in request_caps.supported_efforts:
+                params["output_config"] = {"effort": effort}
+                logger.info(
+                    "[PROVIDER] output_config.effort=%s for %s",
+                    effort,
+                    params["model"],
+                )
+            else:
+                logger.warning(
+                    "[PROVIDER] Effort level '%s' not supported by %s "
+                    "(supported: %s) — omitting output_config.effort",
+                    effort,
+                    params["model"],
+                    request_caps.supported_efforts,
+                )
 
         # Add stop_sequences if specified
         if stop_sequences := kwargs.get("stop_sequences"):
