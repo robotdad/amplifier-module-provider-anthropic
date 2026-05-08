@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+from decimal import Decimal
 from threading import Lock
 from typing import Any
 
@@ -55,6 +56,8 @@ from anthropic import RateLimitError as AnthropicRateLimitError
 from anthropic._exceptions import (
     OverloadedError as AnthropicOverloadedError,
 )  # Not exported in public API as of SDK v0.96.0 (private import still works)
+
+from ._cost import compute_cost
 
 
 @dataclass
@@ -336,6 +339,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """
     config = config or {}
 
+    _totals: dict = {"cost_usd": None, "has_data": False}
+
+    def _add_cost(cost) -> None:
+        if cost is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
+            _totals["has_data"] = True
+
     # Get API key from config or environment
     api_key = config.get("api_key")
     if not api_key:
@@ -345,8 +355,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         logger.warning("No API key found for Anthropic provider")
         return None
 
-    provider = AnthropicProvider(api_key, config, coordinator)
+    provider = AnthropicProvider(api_key, config, coordinator, add_cost=_add_cost)
     await coordinator.mount("providers", provider, name="anthropic")
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-anthropic",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
     logger.info("Mounted AnthropicProvider")
 
     # Return cleanup function that delegates to provider.close().
@@ -414,6 +429,7 @@ class AnthropicProvider:
         api_key: str | None = None,
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
+        add_cost=None,
     ):
         """
         Initialize Anthropic provider.
@@ -584,6 +600,7 @@ class AnthropicProvider:
         # detected repeatedly across LLM iterations (since synthetic results
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
+        self._add_cost = add_cost or (lambda cost: None)
 
     @property
     def client(self) -> AsyncAnthropic:
@@ -2655,13 +2672,18 @@ class AnthropicProvider:
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 # Build usage dict per #69 schema — is-not-None guards for cache fields
                 _event_usage: dict[str, Any] = {
-                    "input_tokens":  chat_response.usage.input_tokens,
+                    "input_tokens": chat_response.usage.input_tokens,
                     "output_tokens": chat_response.usage.output_tokens,
                 }
                 if chat_response.usage.cache_read_tokens is not None:
-                    _event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                    _event_usage["cache_read_tokens"] = (
+                        chat_response.usage.cache_read_tokens
+                    )
                 if chat_response.usage.cache_write_tokens is not None:
-                    _event_usage["cache_write_tokens"] = chat_response.usage.cache_write_tokens
+                    _event_usage["cache_write_tokens"] = (
+                        chat_response.usage.cache_write_tokens
+                    )
+                _event_usage["cost_usd"] = chat_response.usage.cost_usd
                 response_event: dict[str, Any] = {
                     "provider": "anthropic",
                     "model": params["model"],
@@ -3354,6 +3376,22 @@ class AnthropicProvider:
             usage_kwargs["cache_read_input_tokens"] = cache_read
 
         usage = Usage(**usage_kwargs)
+
+        cost = compute_cost(
+            response.model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cache_read_input_tokens=getattr(
+                response.usage, "cache_read_input_tokens", 0
+            )
+            or 0,
+            cache_creation_input_tokens=getattr(
+                response.usage, "cache_creation_input_tokens", 0
+            )
+            or 0,
+        )
+        usage = usage.model_copy(update={"cost_usd": cost})
+        self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
