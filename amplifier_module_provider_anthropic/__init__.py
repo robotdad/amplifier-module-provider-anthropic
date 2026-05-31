@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from decimal import Decimal
 from threading import Lock
 from typing import Any
@@ -2394,15 +2395,184 @@ class AnthropicProvider:
                 # Use streaming API to support large context windows
                 # (Anthropic requires streaming for operations > 10 min)
                 rate_limit_info: dict[str, Any] = {}
-                if self.use_streaming:
-                    async with asyncio.timeout(self.timeout):
-                        async with self.client.messages.stream(**params) as stream:
-                            response = await stream.get_final_message()
-                            # Capture rate limit headers from stream response
-                            if hasattr(stream, "response") and stream.response:
-                                rate_limit_info = self._extract_rate_limit_headers(
-                                    stream.response.headers
-                                )
+
+                # Per-request non-streaming override via request.metadata:
+                #   metadata={"stream": False}
+                # Callers (e.g. session-naming background tasks) that must NOT
+                # emit llm:stream_* events set this flag.  It overrides
+                # self.use_streaming for this single call only — the shared
+                # provider instance's default behavior is completely unchanged.
+                _metadata = getattr(request, "metadata", None)
+                _use_streaming = self.use_streaming
+                if isinstance(_metadata, dict) and _metadata.get("stream") is False:
+                    _use_streaming = False
+
+                if _use_streaming:
+                    # ----- Streaming path with per-block event emission --------
+                    # We iterate the SDK's event stream rather than calling
+                    # get_final_message() directly, so we can emit the full
+                    # block lifecycle (start/delta/end) on the hook bus. The
+                    # SDK still accumulates internally; get_final_message()
+                    # after the loop returns the complete assembled Message.
+                    #
+                    # Events emitted on the hook bus, per content block
+                    # (v3 — separate streaming-lifecycle channel):
+                    #   llm:stream_block_start   when a new block begins (with
+                    #                            block_type so the renderer knows
+                    #                            to open a Live region or print a
+                    #                            placeholder)
+                    #   llm:stream_block_delta   for each text_delta AND thinking_delta
+                    #                            fragment (block_type in payload
+                    #                            distinguishes text vs thinking)
+                    #   llm:stream_block_end     when the block streaming completes
+                    #
+                    # These events are on a SEPARATE channel from the atomic
+                    # renderer's content_block:start/end events (synthesized by
+                    # loop-streaming from the assembled response). The streaming
+                    # overlay subscribes to llm:stream_* only. The atomic renderer
+                    # subscribes to content_block:* only. No payload field-parity
+                    # requirement between the two channels — eliminates the
+                    # regression class that produced missing total_blocks/usage.
+                    #
+                    # If the stream aborts mid-flight (timeout / disconnect /
+                    # mid-stream API error) and we already emitted at least one
+                    # delta, we also emit llm:stream_aborted before re-raising
+                    # so the renderer hook can close any open Live regions
+                    # cleanly.
+                    request_id = str(uuid.uuid4())
+                    block_sequences: dict[int, int] = {}
+                    block_types: dict[int, str] = {}
+                    partial_emitted = False
+                    hooks_available = self.coordinator and hasattr(
+                        self.coordinator, "hooks"
+                    )
+                    try:
+                        async with asyncio.timeout(self.timeout):
+                            async with self.client.messages.stream(
+                                **params
+                            ) as stream:
+                                async for event in stream:
+                                    etype = type(event).__name__
+                                    idx = getattr(event, "index", None)
+                                    if etype == "RawContentBlockStartEvent":
+                                        if idx is None:
+                                            continue
+                                        block = getattr(event, "content_block", None)
+                                        btype = (
+                                            getattr(block, "type", "text")
+                                            if block is not None
+                                            else "text"
+                                        )
+                                        block_types[idx] = btype
+                                        if hooks_available:
+                                            payload: dict[str, Any] = {
+                                                "request_id": request_id,
+                                                "block_index": idx,
+                                                "block_type": btype,
+                                            }
+                                            # Tool-use blocks carry a name so the
+                                            # streaming overlay's placeholder can
+                                            # show "Building tool call: <name>..."
+                                            if btype == "tool_use" and block is not None:
+                                                name = getattr(block, "name", None)
+                                                if name:
+                                                    payload["name"] = name
+                                            await self.coordinator.hooks.emit(
+                                                "llm:stream_block_start",
+                                                payload,
+                                            )
+                                    elif etype == "RawContentBlockDeltaEvent":
+                                        delta = getattr(event, "delta", None)
+                                        if delta is None or idx is None:
+                                            continue
+                                        seq = block_sequences.get(idx, 0)
+                                        block_sequences[idx] = seq + 1
+                                        dtype = getattr(delta, "type", "")
+                                        if dtype == "text_delta":
+                                            text = getattr(delta, "text", "") or ""
+                                            if text and hooks_available:
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_block_delta",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "block_index": idx,
+                                                        "block_type": block_types.get(
+                                                            idx, "text"
+                                                        ),
+                                                        "sequence": seq,
+                                                        "text": text,
+                                                    },
+                                                )
+                                                partial_emitted = True
+                                        elif dtype == "thinking_delta":
+                                            text = (
+                                                getattr(delta, "thinking", "") or ""
+                                            )
+                                            if text and hooks_available:
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_block_delta",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "block_index": idx,
+                                                        "block_type": block_types.get(
+                                                            idx, "thinking"
+                                                        ),
+                                                        "sequence": seq,
+                                                        "text": text,
+                                                    },
+                                                )
+                                                partial_emitted = True
+                                        # signature_delta and any future delta
+                                        # types are observed silently — the
+                                        # SDK still accumulates them into the
+                                        # final message.
+                                    elif etype in (
+                                        "ParsedContentBlockStopEvent",
+                                        "RawContentBlockStopEvent",
+                                    ):
+                                        if idx is None:
+                                            continue
+                                        if hooks_available:
+                                            btype_end = block_types.get(idx, "text")
+                                            await self.coordinator.hooks.emit(
+                                                "llm:stream_block_end",
+                                                {
+                                                    "request_id": request_id,
+                                                    "block_index": idx,
+                                                    "block_type": btype_end,
+                                                },
+                                            )
+                                    # All other event types (RawMessageStart,
+                                    # ParsedMessageStop, SignatureEvent, etc.)
+                                    # flow through the SDK's internal
+                                    # accumulator and are not surfaced.
+
+                                # Stream drained. Final message is now ready.
+                                response = await stream.get_final_message()
+
+                                # Capture rate limit headers from stream response
+                                if hasattr(stream, "response") and stream.response:
+                                    rate_limit_info = self._extract_rate_limit_headers(
+                                        stream.response.headers
+                                    )
+                    except Exception as e:
+                        # Mid-stream failure. If we emitted any partial output,
+                        # tell the renderer so it can close any open Live
+                        # regions cleanly. Then re-raise so the outer except
+                        # clauses below translate the SDK error to a kernel
+                        # error type.
+                        if partial_emitted and hooks_available:
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_aborted",
+                                {
+                                    "request_id": request_id,
+                                    "error": {
+                                        "type": type(e).__name__,
+                                        "msg": str(e),
+                                    },
+                                },
+                            )
+                        raise
                 else:
                     # Use with_raw_response to access headers
                     raw_response = await asyncio.wait_for(
