@@ -2538,9 +2538,7 @@ class AnthropicProvider:
                     )
                     try:
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.messages.stream(
-                                **params
-                            ) as stream:
+                            async with self.client.messages.stream(**params) as stream:
                                 async for event in stream:
                                     etype = type(event).__name__
                                     idx = getattr(event, "index", None)
@@ -2563,7 +2561,10 @@ class AnthropicProvider:
                                             # Tool-use blocks carry a name so the
                                             # streaming overlay's placeholder can
                                             # show "Building tool call: <name>..."
-                                            if btype == "tool_use" and block is not None:
+                                            if (
+                                                btype == "tool_use"
+                                                and block is not None
+                                            ):
                                                 name = getattr(block, "name", None)
                                                 if name:
                                                     payload["name"] = name
@@ -2595,9 +2596,7 @@ class AnthropicProvider:
                                                 )
                                                 partial_emitted = True
                                         elif dtype == "thinking_delta":
-                                            text = (
-                                                getattr(delta, "thinking", "") or ""
-                                            )
+                                            text = getattr(delta, "thinking", "") or ""
                                             if text and hooks_available:
                                                 await self.coordinator.hooks.emit(
                                                     "llm:stream_block_delta",
@@ -3175,6 +3174,51 @@ class AnthropicProvider:
         cleaned.pop("visibility", None)
         return cleaned
 
+    def _convert_tool_result_blocks(self, blocks: list[Any]) -> list[dict[str, Any]]:
+        """Convert plain content-block dicts into Anthropic wire format.
+
+        Shared by two callers:
+        - the tool_result branch of ``_convert_messages`` (a ToolResult.output
+          image-vision carrier, reconstructed by loop-streaming into the
+          tool-role message's ``content`` as a list of block dicts)
+        - the pre-existing user-message image branch (unchanged behavior)
+
+        Only ``text`` and ``image`` (base64 source) blocks are recognized;
+        any other block type is silently skipped, matching the pre-existing
+        user-message behavior exactly (no regression for that path).
+
+        Each output block is a brand-new dict containing only the
+        whitelisted wire fields (``type``/``text`` or ``type``/``source``) -
+        extraneous fields such as ``visibility`` (not accepted by the
+        Anthropic API on reconstructed blocks) are never copied onto the
+        wire, since we never copy the source dict wholesale.
+        """
+        converted: list[dict[str, Any]] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                converted.append({"type": "text", "text": block.get("text", "")})
+            elif block_type == "image":
+                source = block.get("source", {})
+                if source.get("type") == "base64":
+                    converted.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": source.get("media_type", "image/jpeg"),
+                                "data": source.get("data"),
+                            },
+                        }
+                    )
+                else:
+                    logger.warning(
+                        f"Unsupported image source type: {source.get('type')}"
+                    )
+        return converted
+
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
 
@@ -3245,11 +3289,23 @@ class AnthropicProvider:
                         i += 1
                         continue
 
+                    raw_content = tool_msg.get("content", "")
+                    if isinstance(raw_content, list):
+                        # Content-block carrier (image-vision round-trip):
+                        # loop-streaming reconstructed the tool-role message
+                        # content as a list of plain content-block dicts
+                        # instead of a get_serialized_output() string.
+                        # Convert each block into Anthropic's tool_result
+                        # content-block wire format.
+                        wire_content = self._convert_tool_result_blocks(raw_content)
+                    else:
+                        wire_content = raw_content
+
                     tool_results.append(
                         {
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
-                            "content": tool_msg.get("content", ""),
+                            "content": wire_content,
                         }
                     )
                     i += 1
